@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  UUID:
+    Description: UUID of stack items
+    Type: String
+  vpcEndpoint:
+    Description: vpce
+    Type: String
+    Default: vpce-xxxxxxxx
+
+Resources:
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+      Name: !Sub "frontend-${UUID}-API"
+      Policy: {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "execute-api:Invoke",
+                "Resource": [
+                    "execute-api:/*"
+                ]
+            },
+            {
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "execute-api:Invoke",
+                "Resource": [
+                    "execute-api:/*"
+                ],
+                "Condition" : {
+                    "StringNotEquals": {
+                        "aws:SourceVpce": !Sub "${vpcEndpoint}"
+                    }
+                }
+            }
+        ]
+      }
+
+  APIResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId  
+      PathPart: !Sub "App-Lambda-${UUID}"
+  APIPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName:  !Ref MyLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+  APIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref APIResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: "ANY"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:App-Lambda-${UUID}/invocations"
+    DependsOn: APIPermission
+  LambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InlinePolicy
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      RoleName: !Sub "LambdaServiceRole-${UUID}"
+
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "App-Lambda-${UUID}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaServiceRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Environment:
+        Variables:
+          ENVVAL01: "EN_VAL01"
+      Code:
+        ZipFile: |
+          # coding: utf-8
+          import json
+          import os
+
+          print(os.environ["ENVVAL01"])
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
