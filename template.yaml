@@ -4,58 +4,79 @@ Parameters:
   UUID:
     Description: UUID of stack items
     Type: String
-  vpcEndpoint:
-    Description: vpce
+  APIPath:
     Type: String
-    Default: vpce-xxxxxxxx
+    Default: TrialPath
+  PartitionKey:
+    Type: String
+    Default: pipelineID
+  # vpcEndpoint:
+  #   Description: vpce
+  #   Type: String
+  #   Default: vpce-xxxxxxxx
 
 Resources:
+  MyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub GitReuslt-${UUID}
+      AttributeDefinitions:
+        - AttributeName: !Ref PartitionKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref PartitionKey
+          KeyType: HASH
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
   RestAPI:
     Type: AWS::ApiGateway::RestApi
     Properties:
       EndpointConfiguration:
         Types:
-          - PRIVATE
+          - REGIONAL
+          # - PRIVAETE
       Name: !Sub "frontend-${UUID}-API"
-      Policy: {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": "execute-api:Invoke",
-                "Resource": [
-                    "execute-api:/*"
-                ]
-            },
-            {
-                "Effect": "Deny",
-                "Principal": "*",
-                "Action": "execute-api:Invoke",
-                "Resource": [
-                    "execute-api:/*"
-                ],
-                "Condition" : {
-                    "StringNotEquals": {
-                        "aws:SourceVpce": !Sub "${vpcEndpoint}"
-                    }
-                }
-            }
-        ]
-      }
+      # Policy: {
+      #   "Version": "2012-10-17",
+      #   "Statement": [
+      #       {
+      #           "Effect": "Allow",
+      #           "Principal": "*",
+      #           "Action": "execute-api:Invoke",
+      #           "Resource": [
+      #               "execute-api:/*"
+      #           ]
+      #       },
+      #       {
+      #           "Effect": "Deny",
+      #           "Principal": "*",
+      #           "Action": "execute-api:Invoke",
+      #           "Resource": [
+      #               "execute-api:/*"
+      #           ],
+      #           "Condition" : {
+      #               "StringNotEquals": {
+      #                   "aws:SourceVpce": !Sub "${vpcEndpoint}"
+      #               }
+      #           }
+      #       }
+      #   ]
+      # }
 
   APIResource:
     Type: "AWS::ApiGateway::Resource"
     Properties:
       RestApiId: !Ref RestAPI
       ParentId: !GetAtt RestAPI.RootResourceId  
-      PathPart: !Sub "App-Lambda-${UUID}"
+      PathPart: !Ref APIPath
   APIPermission:
     Type: "AWS::Lambda::Permission"
     Properties:
       FunctionName:  !Ref MyLambdaFunction
       Action: "lambda:InvokeFunction"
-      Principal: "apigateway.amazonaws.com"
+      Principal: apigateway.amazonaws.com
   APIMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -65,9 +86,21 @@ Resources:
       AuthorizationType: NONE
       Integration:
         Type: AWS_PROXY
-        IntegrationHttpMethod: "ANY"
-        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:App-Lambda-${UUID}/invocations"
+        IntegrationHttpMethod: "POST"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunction.Arn}/invocations"
     DependsOn: APIPermission
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestAPI
+    DependsOn: APIMethod
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestAPI
+      StageName: prod
+      Description: prod stage
+      DeploymentId: !Ref APIDeployment
   LambdaServiceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -86,31 +119,116 @@ Resources:
               - Effect: Allow
                 Action: iam:PassRole
                 Resource: '*'
+                
       ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
       - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      - arn:aws:iam::aws:policy/AmazonS3FullAccess
       RoleName: !Sub "LambdaServiceRole-${UUID}"
 
   MyLambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "App-Lambda-${UUID}"
-      Handler: index.lambda_handler
+      Handler: index.handler
       Role: !GetAtt LambdaServiceRole.Arn
-      Runtime: python3.11
+      Runtime: nodejs18.x
       Timeout: 300
       Environment:
         Variables:
-          ENVVAL01: "EN_VAL01"
+          APIPATH: !Sub prod/${APIPath}
+          APIURL: !Sub https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/
+          BUCKETNAME01: images-for-serverless-page
+          DYNAMODB_TALBENAME: !Ref MyTable
+          IMAGE_KEY01: background.png
+          PARTITION_KEY: !Ref PartitionKey
+
       Code:
         ZipFile: |
-          # coding: utf-8
-          import json
-          import os
+          const { DynamoDBClient, PutItemCommand, ScanCommand } = require("@aws-sdk/client-dynamodb")
+          const { GetObjectCommand, S3Client } = require ("@aws-sdk/client-s3");
+          const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-          print(os.environ["ENVVAL01"])
+          const client = new DynamoDBClient({ region: "ap-northeast-1" });
+          const s3Client = new S3Client({ region: "ap-northeast-1" });
+          const TABLE_NAME = process.env.DYNAMODB_TALBENAME
+          const URL = process.env.APIURL
+          const apiPath = process.env.APIPATH
+          const bucketName = process.env.BUCKETNAME01
+          const imageKey = process.env.IMAGE_KEY01
+          const partitionKey = process.env.PARTITION_KEY
+
+          exports.handler = async (event) => {
+              switch (event.httpMethod) {
+                  case "GET":
+                      return getItems();
+                  case "POST":
+                      return addItem(event);
+                  default:
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              "Content-Type": "text/html",
+                          },
+                          body: "<p>Invalid method</p>",
+                      };
+              }
+          };
+
+          const getItems = async () => {
+              const command = new ScanCommand({ TableName: TABLE_NAME });
+              const data = await client.send(command);
+
+              // 署名付きURLを取得
+              const s3command = new GetObjectCommand({
+                  Bucket: bucketName,
+                  Key: imageKey
+              });
+              const imageUrl = await getSignedUrl(s3Client, s3command, { expiresIn: 3600 });
+
+              let body = `<form action="${URL}${apiPath}" method="post" enctype="application/x-www-form-urlencoded">
+                  <input type="text" name="data" placeholder="Enter data" required />
+                  <button type="submit">Add</button>
+                  </form>
+                  <img src="${imageUrl}" alt="S3 Image" /><br><br>
+                  <table border="1"><tr><th>ID</th><th>Data</th></tr>`;
+
+              
+              data.Items.forEach(item => {
+                  body += `<tr><td>${item[partitionKey]["S"]}</td><td>${item.data.S}</td></tr>`;
+              });
+              body += "</table>";
 
               return {
-                  'statusCode': 200,
-                  'body': json.dumps('Hello from Lambda!')
-              }
+                  statusCode: 200,
+                  headers: {
+                      "Content-Type": "text/html",
+                  },
+                  body: body,
+              };
+          };
+
+          const addItem = async (event) => {
+              var Item_ = {}
+              Item_[partitionKey] = { S: Date.now().toString() }
+              Item_["data"] = { S: unescape(event.body.split('=')[1]) }
+              const command = new PutItemCommand({
+                  TableName: TABLE_NAME,
+                  Item: Item_,
+              });
+
+              await client.send(command);
+
+              return {
+                  statusCode: 303,
+                  headers: {
+                      "Location": "/" + apiPath,
+                      "Content-Type": "text/html",
+                  },
+                  body: "",
+              };
+          };
+
+Outputs:
+  APIENdppointURL: # 渡す値を出力する
+    Value: !Sub https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/${APIPath}
