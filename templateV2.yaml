@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  UUID:
+    Description: UUID of stack items
+    Type: String
+  APIPath:
+    Type: String
+    Default: TrialPath
+  PartitionKey:
+    Type: String
+    Default: pipelineID
+  LambdaCodeKey:
+    Type: String
+  LambdaCodeBucket:
+    Type: String
+  
+  # vpcEndpoint:
+  #   Description: vpce
+  #   Type: String
+  #   Default: vpce-xxxxxxxx
+
+
+Resources:
+  MyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub GitReuslt-${UUID}
+      AttributeDefinitions:
+        - AttributeName: !Ref PartitionKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref PartitionKey
+          KeyType: HASH
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+          # - PRIVAETE
+      Name: !Sub "frontend-${UUID}-API"
+      # Policy: {
+      #   "Version": "2012-10-17",
+      #   "Statement": [
+      #       {
+      #           "Effect": "Allow",
+      #           "Principal": "*",
+      #           "Action": "execute-api:Invoke",
+      #           "Resource": [
+      #               "execute-api:/*"
+      #           ]
+      #       },
+      #       {
+      #           "Effect": "Deny",
+      #           "Principal": "*",
+      #           "Action": "execute-api:Invoke",
+      #           "Resource": [
+      #               "execute-api:/*"
+      #           ],
+      #           "Condition" : {
+      #               "StringNotEquals": {
+      #                   "aws:SourceVpce": !Sub "${vpcEndpoint}"
+      #               }
+      #           }
+      #       }
+      #   ]
+      # }
+
+  APIResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId  
+      PathPart: !Ref APIPath
+  APIPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName:  !Ref MyLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+  APIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref APIResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: "POST"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunction.Arn}/invocations"
+    DependsOn: APIPermission
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestAPI
+    DependsOn: APIMethod
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestAPI
+      StageName: prod
+      Description: prod stage
+      DeploymentId: !Ref APIDeployment
+  LambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InlinePolicy
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+                
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      RoleName: !Sub "LambdaServiceRole-${UUID}"
+
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "App-Lambda-${UUID}"
+      Handler: index.handler
+      Role: !GetAtt LambdaServiceRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 300
+      Environment:
+        Variables:
+          APIPATH: !Sub prod/${APIPath}
+          APIURL: !Sub https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/
+          BUCKETNAME01: images-for-serverless-page
+          DYNAMODB_TALBENAME: !Ref MyTable
+          IMAGE_KEY01: background.png
+          PARTITION_KEY: !Ref PartitionKey
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+
+
+Outputs:
+  APIENdppointURL: # 渡す値を出力する
+    Value: !Sub https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/${APIPath}
